@@ -1,0 +1,175 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>园区上行 HTB 调速台 · 告警 / 录像带宽保障</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head>
+<body>
+<header class="topbar">
+  <div class="brand">
+    <span class="logo">⛨</span>
+    <div>
+      <h1>园区上行调速台</h1>
+      <p class="sub">tc HTB · 告警(1:10 / UDP 5001) 与 录像(1:20 / UDP 5002) 保底 + 余量借用</p>
+    </div>
+  </div>
+  <div class="topmeta">
+    <span id="backendBadge" class="badge badge-{{ 'stub' if backend == 'stub' else 'real' }}">
+      后端：{{ '模拟(stub)' if backend == 'stub' else '真实 tc' }}
+    </span>
+    <span class="badge badge-net">{{ topo.src_netns or 'root-ns' }} / {{ topo.dev }}</span>
+  </div>
+</header>
+
+<main class="layout">
+
+  <!-- ===================== 调速面板 ===================== -->
+  <section class="card" id="configCard">
+    <h2>① 速率配置（Mbit/s）</h2>
+    <p class="hint">
+      约束：<code>告警保底 + 录像保底 ≤ 当时生效总速率</code>，
+      且每类 <code>保底 ≤ 上限(ceil) ≤ 总速率</code>。
+      空闲一路时，另一路可借用到自身 ceil。调整只下发
+      <code>tc class change</code>，原 HTB 队列与计数继续保留。
+    </p>
+
+    <form id="configForm" class="grid-form">
+      <div class="field total-field">
+        <label for="total_mbps">上行总速率（根类 1:1）</label>
+        <input id="total_mbps" name="total_mbps" type="number" min="0.064" step="0.1" required>
+      </div>
+
+      <fieldset class="class-box alarm-box">
+        <legend>告警流 1:10</legend>
+        <div class="field">
+          <label for="alarm_rate_mbps">保底 rate</label>
+          <input id="alarm_rate_mbps" name="alarm_rate_mbps" type="number" min="0.064" step="0.1" required>
+        </div>
+        <div class="field">
+          <label for="alarm_ceil_mbps">上限 ceil</label>
+          <input id="alarm_ceil_mbps" name="alarm_ceil_mbps" type="number" min="0.064" step="0.1" required>
+        </div>
+      </fieldset>
+
+      <fieldset class="class-box video-box">
+        <legend>录像流 1:20</legend>
+        <div class="field">
+          <label for="video_rate_mbps">保底 rate</label>
+          <input id="video_rate_mbps" name="video_rate_mbps" type="number" min="0.064" step="0.1" required>
+        </div>
+        <div class="field">
+          <label for="video_ceil_mbps">上限 ceil</label>
+          <input id="video_ceil_mbps" name="video_ceil_mbps" type="number" min="0.064" step="0.1" required>
+        </div>
+      </fieldset>
+
+      <div id="formInvariant" class="invariant"></div>
+
+      <div class="fault-row">
+        <label class="chk">
+          <input type="checkbox" id="faultEnabled">
+          注入中途故障
+        </label>
+        <label>第
+          <input type="number" id="faultStep" min="1" value="2" style="width:4.5rem">
+          条命令失败
+        </label>
+        <select id="faultMode" title="故障方式">
+          <option value="stub">模拟失败（不执行该命令）</option>
+          <option value="real">真实坏命令（tc 报错）</option>
+        </select>
+      </div>
+
+      <div class="btn-row">
+        <button type="button" id="btnPreview" class="btn">预览安全步骤</button>
+        <button type="submit" class="btn btn-primary">应用调速（发包中也可）</button>
+        <button type="button" id="btnDemoFail" class="btn btn-danger">⚡ 一键演示中途失败并回退</button>
+      </div>
+    </form>
+
+    <div id="actionBanner" class="banner hidden"></div>
+    <div id="planView" class="plan-view"></div>
+    <div id="resultView"></div>
+  </section>
+
+  <!-- ===================== 试发与实测 ===================== -->
+  <section class="card" id="flowsCard">
+    <h2>② 两路 UDP 试发与实测吞吐</h2>
+    <div class="flows">
+      <div class="flow-card alarm-box" data-flow="alarm">
+        <div class="flow-head">
+          <span class="dot"></span><strong>告警流</strong>
+          <span class="mono">UDP → {{ topo.dst_ip }}:5001 · class 1:10</span>
+        </div>
+        <div class="throughput">
+          <span class="rx-rate" id="rx-alarm">0.000</span><span class="unit">Mbit/s 实测</span>
+        </div>
+        <div class="bar"><div class="bar-fill bar-alarm" id="bar-alarm"></div>
+          <div class="bar-guarantee" id="gbar-alarm" title="保底"></div></div>
+        <svg class="spark" id="spark-alarm" width="100%" height="42" preserveAspectRatio="none"></svg>
+        <dl class="stats-grid">
+          <div><dt>发送</dt><dd id="tx-alarm">—</dd></div>
+          <div><dt>收包</dt><dd id="pk-alarm">0</dd></div>
+          <div><dt>丢包(序号缺口)</dt><dd id="loss-alarm">0</dd></div>
+          <div><dt>PID</dt><dd id="pid-alarm">—</dd></div>
+        </dl>
+        <div class="flow-ctrl">
+          <input type="number" id="rate-alarm" value="12" min="0" step="1" title="承诺发送速率 Mbit/s，0=打满">
+          <span>Mbit/s 发送负载</span>
+          <button class="btn btn-small btn-primary" data-act="start" data-flow="alarm">开始</button>
+          <button class="btn btn-small" data-act="stop" data-flow="alarm">停止</button>
+        </div>
+      </div>
+
+      <div class="flow-card video-box" data-flow="video">
+        <div class="flow-head">
+          <span class="dot"></span><strong>录像流</strong>
+          <span class="mono">UDP → {{ topo.dst_ip }}:5002 · class 1:20</span>
+        </div>
+        <div class="throughput">
+          <span class="rx-rate" id="rx-video">0.000</span><span class="unit">Mbit/s 实测</span>
+        </div>
+        <div class="bar"><div class="bar-fill bar-video" id="bar-video"></div>
+          <div class="bar-guarantee" id="gbar-video" title="保底"></div></div>
+        <svg class="spark" id="spark-video" width="100%" height="42" preserveAspectRatio="none"></svg>
+        <dl class="stats-grid">
+          <div><dt>发送</dt><dd id="tx-video">—</dd></div>
+          <div><dt>收包</dt><dd id="pk-video">0</dd></div>
+          <div><dt>丢包(序号缺口)</dt><dd id="loss-video">0</dd></div>
+          <div><dt>PID</dt><dd id="pid-video">—</dd></div>
+        </dl>
+        <div class="flow-ctrl">
+          <input type="number" id="rate-video" value="12" min="0" step="1" title="承诺发送速率 Mbit/s，0=打满">
+          <span>Mbit/s 发送负载</span>
+          <button class="btn btn-small btn-primary" data-act="start" data-flow="video">开始</button>
+          <button class="btn btn-small" data-act="stop" data-flow="video">停止</button>
+        </div>
+      </div>
+    </div>
+    <div class="btn-row">
+      <button id="btnStartBoth" class="btn">两路同时开始</button>
+      <button id="btnStopAll" class="btn">全部停止</button>
+      <span class="hint" id="receiverState"></span>
+    </div>
+  </section>
+
+  <!-- ===================== 内核配置 ===================== -->
+  <section class="card kernel-card">
+    <h2>③ 内核 / tc 实际配置
+      <span class="right">
+        <label class="chk"><input type="checkbox" id="kernelAuto" checked> 5 秒自动刷新</label>
+        <button id="btnKernelRefresh" class="btn btn-small">立即刷新</button>
+      </span>
+    </h2>
+    <div id="kernelMeta" class="hint"></div>
+    <div id="kernelView" class="kernel-view"><pre>加载中…</pre></div>
+  </section>
+
+</main>
+
+<script id="initialConfig" type="application/json">{{ initial_config | tojson }}</script>
+<script src="{{ url_for('static', filename='app.js') }}"></script>
+</body>
+</html>

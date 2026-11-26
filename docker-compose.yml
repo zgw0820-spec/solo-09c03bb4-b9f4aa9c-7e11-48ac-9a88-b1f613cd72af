@@ -1,0 +1,45 @@
+# 园区上行 HTB 调速实验台
+#
+#   docker compose up --build
+#   浏览器打开 http://localhost:8080
+#
+# 单个 privileged 服务在容器内用 network namespace + veth 构造一条
+# 隔离 Linux 链路，并在发送端 veth 上挂载 tc HTB。
+services:
+  linklab:
+    build:
+      context: ./service
+    image: gsb-linklab:latest
+    container_name: gsb-linklab
+    # `ip netns`/veth/tc qdisc 需要网络管理与挂载权限；实验环境直接 privileged。
+    privileged: true
+    init: true
+    ports:
+      # 可用 WEB_PORT=8081 docker compose up 覆盖宿主机端口
+      - "${WEB_PORT:-8080}:8080"
+    environment:
+      LAB_BACKEND: "real"
+      LAB_RUN_DIR: "/run/lab"
+      LAB_SRC_NS: "lab-src"
+      LAB_DST_NS: "lab-dst"
+      LAB_DEV: "uplink"
+      LAB_DST_IP: "10.77.0.2"
+      PYTHONUNBUFFERED: "1"
+    volumes:
+      - labrun:/run/lab
+      # 便于容器内 modprobe 与宿主机内核模块匹配；缺失时不影响 netlink 自动加载。
+      - /lib/modules:/lib/modules:ro
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request,sys; r=urllib.request.urlopen('http://127.0.0.1:8080/api/state', timeout=3); sys.exit(0 if r.status==200 else 1)"
+      interval: 5s
+      timeout: 4s
+      retries: 12
+      start_period: 8s
+    restart: unless-stopped
+
+volumes:
+  labrun:
