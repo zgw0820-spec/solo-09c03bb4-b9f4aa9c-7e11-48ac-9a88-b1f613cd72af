@@ -4,7 +4,20 @@
 Listens on one port per flow, tracks bytes/packets/sequence loss and
 writes per-flow throughput samples to a JSON stats file every second.
 
-Self-contained (stdlib only).
+DSCP / ECN verification
+-----------------------
+Each socket enables ``IP_RECVTOS`` and reads the *actually received* IPv4
+TOS byte out of the recvmsg(2) ancillary data (no raw sockets / libpcap
+needed).  A per-flow :class:`~linklab.dscp.MarkVerifier` splits received
+packets into the old and the new segment at the sender-reported boundary
+sequence number -- late old-segment packets therefore stay in the old
+segment -- and keeps only fixed-size counters (bounded memory).  The new
+segment is reported as "pending" until its first packet arrives.
+
+The boundary plan is published per flow by the FlowManager at
+``<run>/mark_plan_<flow>.json`` and re-read by the writer thread.
+
+Self-contained (stdlib only, plus the sibling pure-logic dscp module).
 """
 from __future__ import annotations
 
@@ -20,6 +33,9 @@ import time
 from collections import deque
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from dscp import MarkVerifier  # noqa: E402
+
 MAGIC = b"LL01"
 HEADER = struct.Struct("!4sBQd")
 
@@ -31,9 +47,14 @@ def _handle_signal(signum, frame):  # noqa: ANN001
 
 
 class FlowStats:
-    def __init__(self, name: str, port: int):
+    def __init__(self, name: str, port: int, plan_path: Path | None = None,
+                 reorder_every: int = 0):
         self.name = name
         self.port = port
+        self.plan_path = plan_path
+        # Test-only: hold one packet back every N packets to emulate the
+        # "old segment packet arrives late" path. 0 disables it.
+        self.reorder_every = max(0, int(reorder_every))
         self.lock = threading.Lock()
         self.bytes_total = 0
         self.packets_total = 0
@@ -44,8 +65,13 @@ class FlowStats:
         # (monotonic time, cumulative bytes)
         self.samples: deque[tuple[float, int]] = deque(maxlen=16)
         self.samples.append((time.monotonic(), 0))
+        self.verifier = MarkVerifier(flow=name)
+        # Test-only held packet ``(nbytes, seq, tos)`` used to emulate a
+        # late old-segment arrival. None when nothing is held back.
+        self._held: tuple[int, int | None, int | None] | None = None
+        self._arrival_count = 0
 
-    def record(self, nbytes: int, seq: int | None) -> None:
+    def _deliver(self, nbytes: int, seq: int | None, tos: int | None) -> None:
         with self.lock:
             self.bytes_total += nbytes
             self.packets_total += 1
@@ -57,6 +83,40 @@ class FlowStats:
                 elif seq <= self.last_seq:
                     self.duplicates += 1
                 self.last_seq = seq if self.last_seq is None else max(self.last_seq, seq)
+            self.verifier.record(tos, seq)
+
+    def record(self, nbytes: int, seq: int | None, tos: int | None) -> None:
+        # Optional reordering injection for the late-packet test: every Nth
+        # packet is held back and released when the next one arrives, so the
+        # held (older seq) packet is accounted for after the newer one.
+        if self.reorder_every and seq is not None:
+            self._arrival_count += 1
+            if self._arrival_count % self.reorder_every == 0:
+                held = self._held
+                self._held = (nbytes, seq, tos)
+                if held is not None:
+                    self._deliver(*held)
+                return
+            if self._held is not None:
+                held, self._held = self._held, None
+                self._deliver(*held)
+        self._deliver(nbytes, seq, tos)
+
+    def flush_reorder(self) -> None:
+        if self._held is not None:
+            held, self._held = self._held, None
+            self._deliver(*held)
+
+    def refresh_plan(self) -> None:
+        if self.plan_path is None:
+            return
+        with self.lock:
+            if self.plan_path.exists():
+                self.verifier.load_plan_file(self.plan_path)
+            elif self.verifier.plan_request_id is not None:
+                # The plan file was removed at the end of a trial: reset to
+                # a single old-segment verifier for the next sending round.
+                self.verifier = MarkVerifier(flow=self.name)
 
     def snapshot(self) -> dict:
         now_m = time.monotonic()
@@ -82,6 +142,7 @@ class FlowStats:
 
             rate_1s = rate_over(1.0)
             rate_3s = rate_over(3.0)
+            marking = self.verifier.snapshot()
             return {
                 "port": self.port,
                 "running": True,
@@ -94,11 +155,44 @@ class FlowStats:
                 "duplicates": self.duplicates,
                 "last_seq": self.last_seq,
                 "age_s": round(now - self.started, 1),
+                "marking": marking,
             }
 
 
-def serve(name: str, port: int, out: dict[str, FlowStats]) -> None:
-    st = FlowStats(name, port)
+def _recv_one(sock: socket.socket):
+    """Receive one datagram plus its TOS ancillary item.
+
+    Returns ``(data, seq, tos)`` where ``tos`` is None when the platform
+    did not provide IP_RECVTOS ancillary data.
+    """
+    try:
+        data, ancdata, _flags, _addr = sock.recvmsg(65535, 256)
+    except (BlockingIOError, InterruptedError):
+        return None
+    tos = None
+    for level, typ, val in ancdata:
+        # Linux reports the TOS ancillary item with cmsg_type IP_TOS even
+        # though the socket option enabling it is IP_RECVTOS; accept both.
+        if level == socket.IPPROTO_IP and typ in (
+            socket.IP_TOS,
+            getattr(socket, "IP_RECVTOS", socket.IP_TOS),
+        ):
+            if isinstance(val, (bytes, bytearray)):
+                tos = val[0] if val else None
+            else:
+                tos = int(val)
+            break
+    seq = None
+    if len(data) >= HEADER.size:
+        magic, _fid, seq, _ts = HEADER.unpack(data[: HEADER.size])
+        if magic != MAGIC:
+            seq = None
+    return data, seq, tos
+
+
+def serve(name: str, port: int, out: dict[str, FlowStats],
+          plan_path: Path | None, reorder_every: int) -> None:
+    st = FlowStats(name, port, plan_path=plan_path, reorder_every=reorder_every)
     out[name] = st
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -106,27 +200,35 @@ def serve(name: str, port: int, out: dict[str, FlowStats]) -> None:
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 8 * 1024 * 1024)
     except OSError:
         pass
+    try:
+        # Ask the kernel to attach the real IPv4 TOS byte to every packet.
+        sock.setsockopt(socket.IPPROTO_IP, socket.IP_RECVTOS, 1)
+    except OSError:
+        # Older/locked-down platform: throughput still works, marking
+        # verification reports unknown_tos instead of guessing.
+        pass
     sock.bind(("0.0.0.0", port))
     sock.settimeout(0.5)
     while not _stop.is_set():
         try:
-            data, _addr = sock.recvfrom(65535)
+            got = _recv_one(sock)
         except socket.timeout:
             continue
         except OSError:
             break
-        seq = None
-        if len(data) >= HEADER.size:
-            magic, _fid, seq, _ts = HEADER.unpack(data[: HEADER.size])
-            if magic != MAGIC:
-                seq = None
-        st.record(len(data), seq)
+        if got is None:
+            continue
+        data, seq, tos = got
+        st.record(len(data), seq, tos)
+    st.flush_reorder()
     sock.close()
 
 
 def writer_loop(path: Path, flows: dict[str, FlowStats]) -> None:
     while not _stop.is_set():
         time.sleep(1.0)
+        for st in flows.values():
+            st.refresh_plan()
         data = {
             "updated_at": time.time(),
             "flows": {name: st.snapshot() for name, st in flows.items()},
@@ -149,18 +251,33 @@ def main() -> int:
         help="name:port, repeatable (default alarm:5001 video:5002)",
     )
     ap.add_argument("--stats-file", required=True)
+    ap.add_argument(
+        "--plan-dir",
+        default=None,
+        help="directory read for per-flow mark_plan_<flow>.json files",
+    )
+    ap.add_argument(
+        "--reorder-every",
+        type=int,
+        default=0,
+        help="test-only: hold one packet every N to emulate late arrivals",
+    )
     args = ap.parse_args()
 
     signal.signal(signal.SIGTERM, _handle_signal)
     signal.signal(signal.SIGINT, _handle_signal)
 
     specs = args.flow or ["alarm:5001", "video:5002"]
+    plan_dir = Path(args.plan_dir) if args.plan_dir else None
     flows: dict[str, FlowStats] = {}
     threads = []
     for spec in specs:
         name, _, port_s = spec.partition(":")
+        plan_path = plan_dir / f"mark_plan_{name}.json" if plan_dir else None
         t = threading.Thread(
-            target=serve, args=(name, int(port_s), flows), daemon=True
+            target=serve,
+            args=(name, int(port_s), flows, plan_path, args.reorder_every),
+            daemon=True,
         )
         t.start()
         threads.append(t)
@@ -174,6 +291,8 @@ def main() -> int:
         time.sleep(0.3)
 
     # Final stats flush.
+    for st in flows.values():
+        st.refresh_plan()
     data = {
         "updated_at": time.time(),
         "stopped": True,

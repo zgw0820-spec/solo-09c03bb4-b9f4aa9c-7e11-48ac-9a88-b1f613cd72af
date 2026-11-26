@@ -73,11 +73,62 @@ docker compose down            # 加 -v 同时删除状态卷
 | 故障注入 | 可勾选“在第 N 条命令失败”，方式可选**模拟失败**或**真实坏命令**（给 tc argv 追加非法 token，由真实 tc 报错）；另有 **⚡ 一键演示中途失败并回退** |
 | 变更结果 | 逐步展示每条命令（含完整 argv）、rc、stderr、当时生效总速率、该步不变量是否成立；失败时展示原因与完整回退步骤 |
 | ② 试发 | 告警/录像分别 **开始/停止**，互不影响；显示实测 Mbit/s、发送速率、收包数、序号丢包、PID、吞吐条与迷你曲线；支持两路同开/全停 |
+| ② 之 DSCP 换标核验 | 告警每轮试发从 **DSCP 0 / ECT(0)（TOS 0x01）** 开始；网页填入 1～63 的新 DSCP，**发送途中切换一次**，发端不中断、序号接着走、ECN 两位保留；页面显示新标记起用的**分界序号**；收端读实收 IPv4 TOS 按分界分两段核对（晚到旧包仍归旧段），分段显示实收 DSCP/ECN 与错标包数，新段收到包前显示“待确认”；换标失败则继续用旧标记并显示原因。全程**有界内存** |
 | ③ 内核配置 | 实时显示 `tc -s -d qdisc/class show`、`tc -s filter show`、`ip -d link`、netns 列表与 ping；5 秒自动刷新，可手动刷新 |
 
 调速只使用 `tc class change ...`（根类 `1:1` 与子类 `1:10/1:20`），
 **不会** `tc qdisc del` 或重建类，因此原 HTB 队列句柄 `1:` 及其统计队列持续保留。
 可在调速前后对比内核区的 `qdisc htb 1:` 与类统计来确认。
+
+---
+
+## 3.5 DSCP 途中换标核验（园区下游交换机按 DSCP 分队列的前置验证）
+
+下游交换机准备按 DSCP 给告警分队列，本台先在隔离链路上核验“换标”本身是否
+端到端生效。功能只作用于**告警流**（UDP/5001），录像流照常试发、不受影响。
+
+### 标记与切换
+
+- 每个告警发送 socket 以 `setsockopt(IP_TOS, 0x01)` 起始，即 **DSCP 0 / ECT(0)**。
+- 网页“DSCP 换标核验”框可填 **1～63** 的新 DSCP，点“发送途中换标”。
+  发端 `udp_send.py` 的后台线程轮询控制文件，在**发包不中断、序号接着走**的情况下
+  再次 `setsockopt(IP_TOS, (new_dscp<<2)|ECN)`，**ECN 两位原样保留**。
+- 每轮试发（一次开始→停止）**只允许切换一次**；发端与后端各自硬性保证。
+  停止后重新开始即回到 DSCP 0 / ECT(0)、序号从 0 重新计。
+- 发端把“第一个使用新标记的报文序号”作为**分界序号 `boundary_seq`** 写入统计，
+  后端把它发布给收端计划文件 `mark_plan_alarm.json`。
+- 若 `setsockopt` 失败（或 DSCP 非法）：**继续使用旧标记、继续发包（录像照常）**，
+  页面与 API 显示原因，不产生分界计划。
+
+### 收端核验（有界内存）
+
+- 收端 `udp_recv.py` 对每个 socket 置 `IP_RECVTOS`，用 `recvmsg` 辅助数据读取
+  **实收 IPv4 TOS 字节**（无需 raw socket / libpcap），拆出 DSCP（高 6 位）与 ECN（低 2 位）。
+- `dscp.MarkVerifier` 按发端分界把报文分两段：`seq < boundary` 为旧段、
+  `seq >= boundary` 为新段。**晚到的旧段报文按序号仍归旧段**，不会被算成错标。
+- 为消除“计划文件晚于新标记报文到达”的竞态，收端维护一个**定长环形缓冲**
+  （默认 2048 个 `(seq, TOS)`，可配），计划到达时按分界重放缓冲、精确重分段；
+  环形之外的报文必然属于旧段。配合两段定长计数器与封顶的“实收 TOS 分布”表，
+  **无论收多少包，内存占用都有上界**，不做逐包无限堆积。
+- 分段输出：期望/实收 DSCP、ECN 名、包数、DSCP 错标数、ECN 错标数、错标合计、
+  实收 TOS 分布。**新段在收到首个包前显示“待确认（pending）”**，收到后转“已确认”。
+- TOS 无法获取（平台不支持 `IP_RECVTOS`）计入 `unknown_tos`，不猜测、不谎报通过。
+
+### 操作路径（网页）
+
+1. 在告警流卡片点“开始”，看到旧段按 DSCP 0 / ECT(0) 计数、错标 0；
+2. 填新 DSCP（如 20）点“发送途中换标”，横幅提示分界序号；
+3. 收端分段表出现“新段”，首个新包到达前为“待确认”，随后转“已确认”且错标 0；
+4. 再次换标会被拒绝（每轮一次）；停止后开始新一轮即复位。
+
+API：
+
+```bash
+curl -s -X POST localhost:8080/api/flows/alarm/start -H 'Content-Type: application/json' -d '{"rate_mbps":4}'
+curl -s -X POST localhost:8080/api/flows/alarm/remark -H 'Content-Type: application/json' -d '{"new_dscp":20}'
+# -> {"ok":true,"old_dscp":0,"new_dscp":20,"ecn":1,"boundary_seq":919,...}
+curl -s localhost:8080/api/flows   # flows.alarm.rx.marking 内为分段核验结果
+```
 
 ---
 
@@ -137,6 +188,9 @@ curl -s localhost:8080/api/flows
 curl -s -X POST localhost:8080/api/flows/alarm/start -d '{"rate_mbps":12}' \
   -H 'Content-Type: application/json'
 curl -s -X POST localhost:8080/api/flows/video/stop
+# 告警途中换标（每轮一次，1~63；失败保留旧标记并返回原因）
+curl -s -X POST localhost:8080/api/flows/alarm/remark \
+  -H 'Content-Type: application/json' -d '{"new_dscp":20}'
 ```
 
 ---
@@ -156,14 +210,15 @@ service/
     runner.py               # SubprocessRunner / FakeRunner / CmdResult
     tc_manager.py           # 预览、应用、故障注入、回退、内核报告、历史
     setup_lab.py            # 建 netns/veth/HTB/filter（容器启动一次）
-    flows.py                # 两路 sender + receiver 进程管理与状态合并
-    udp_send.py             # 独立定速 UDP 发包脚本（stdlib）
-    udp_recv.py             # 独立接收/测速/丢包统计脚本（stdlib）
+    flows.py                # 两路 sender + receiver 进程管理、换标控制与状态合并
+    dscp.py                 # TOS/DSCP/ECN 原语 + 有界环形缓冲分段核验器（纯逻辑）
+    udp_send.py             # 独立定速 UDP 发包脚本（IP_TOS 打标/途中换标，stdlib）
+    udp_recv.py             # 独立接收/测速/丢包/DSCP·ECN 分段核验脚本（stdlib）
     stub.py                 # 无 CAP_NET_ADMIN 时的内存 tc 模拟后端
     web.py                  # Flask 应用与 API
     templates/index.html
     static/style.css, app.js
-tests/                      # 28 个测试（规划器/回退/Web/真实 loopback 收发）
+tests/                      # 55 个测试（规划器/回退/Web/真实 loopback 收发/DSCP 换标核验）
 scripts/run_tests.sh
 ```
 
@@ -189,15 +244,27 @@ CLI/daemon、无 tc/ip、且禁止 unprivileged user namespace** 的容器
 因此**无法在此环境真正执行 `docker compose up` 或验证 HTB 整形/借用的实测数值**。
 我做了以下可在该环境完成的高强度验证：
 
-1. **单元/集成测试 28 项全部通过**
+1. **单元/集成测试 55 项全部通过**
    `PYTHONPATH=service python3 -m unittest discover -s tests`
    - 不变量校验（保底和、ceil、rate≤ceil、边界）；
    - 安全规划器排序、4000 组随机合法新旧配置的逐步不变量/终态/反向路径；
    - 中途 stub 故障与“真实坏 token”故障后的自动回退、回退失败 drift 上报；
    - 成功调速只出现 `tc class change`，**绝不出现 `qdisc del`**；
-   - Flask 全部 API + 页面渲染（test client，9 项）；
+   - Flask 全部 API + 页面渲染（含换标 API 的 404/409/503 与 DSCP 面板渲染）；
    - **真实子进程 UDP loopback 测试**：8 Mbit/s 定速发送 4 s，接收端实测
-     `rate_mbps > 2`（实际约 8.0）、收包 >200、序号丢包 0。
+     `rate_mbps > 2`（实际约 8.0）、收包 >200、序号丢包 0；
+   - **DSCP 纯逻辑核验器（`test_dscp.py`）**：TOS 字节拼装/拆分全 64×4 组合、
+     1～63 输入校验、按分界分段、晚到旧包归旧段、错标（DSCP/ECN）计数、
+     “计划晚到”环形缓冲重分段、环形上限驱逐与有界性、unknown/无头包处理；
+   - **真实子进程换标端到端（`test_dscp_loopback.py`）**：loopback 上真实
+     `IP_TOS`→`IP_RECVTOS`，途中换 DSCP 20/46，发端报分界、收端两段实收 TOS
+     全对、错标 0、ECN 全程 ECT(0)；并用 `--reorder-every` 注入乱序，验证
+     **晚到旧包仍归旧段**；非法 DSCP(99) 被拒、发端保留 DSCP 0 且继续发包；
+   - **发端 `MarkerController`（`test_marker_controller.py`）**：起始 0x01、
+     成功换标保 ECN 并锁分界、`setsockopt` 失败时保留旧标记并上报原因、
+     非法 DSCP 拒绝、每轮硬性只切一次；
+   - **FlowManager 集成（`test_flow_remark.py`）**：真实进程 start→换标→
+     收端 verified、一轮一次守卫、停止清理计划文件、重启后可再次换标。
 2. **真实 iproute2 6.1.0 二进制校验命令语法**：下载并解包 Debian
    `iproute2` 及其依赖，对规划器/setup 生成的 **109 条 tc argv** 逐一用真
    `tc` 解析（在 `lo` 上跑到 netlink 阶段）。全部通过解析，仅在最后
@@ -211,6 +278,14 @@ CLI/daemon、无 tc/ip、且禁止 unprivileged user namespace** 的容器
    `unknown option "__lab_inject_failure__"`；单独停止告警后其速率归零、
    录像仍保持 8.002；页面/CSS/JS 均 200，`node --check app.js` 通过；
    并用 waitress 以容器同款 WSGI target 启动验证 200。
+   - **换标实测（同一套真实进程）**：告警 4 Mbit/s 发送中 POST
+     `remark {new_dscp:20}` 返回 `ok:true, boundary_seq:919, ecn:1`；收端核验
+     旧段 919 包实收 TOS 全为 `0x01`（DSCP0/ECT0）、新段 978 包实收 TOS 全为
+     `0x51`（DSCP20/ECT0），`verified:true`、`total_mismatch:0`、
+     `unknown_tos:0`；再换 DSCP 30 时新段 TOS 全为 `0x79`（=30<<2|1）。
+     二次换标被拒（每轮一次，HTTP 409）、DSCP 0/99 被拒（409）、未知流 404、
+     未运行换标 409；停止后 `mark_*` 文件清理，重启新一轮可再次换标；
+     录像流 `plan_installed:false`，不受影响。
 4. `docker-compose.yml` 通过 YAML 解析与字段人工核对；shell 脚本具备可执行位。
 
 ### 需在具备 Docker 的目标机上补做的实测（命令与预期）
@@ -223,6 +298,9 @@ docker compose ps                       # healthy
 # 3) 在线调速：两路发送中把总速率改 8、保底 1.6/4.8、ceil 8，观察吞吐与
 #    “内核配置”中 1:1/1:10/1:20 rate/ceil 立即变化，而 qdisc handle 仍为 1:
 # 4) 故障：点“一键演示中途失败并回退”，查看原因与回退；刷新内核配置确认恢复
+# 5) DSCP 换标：告警“开始”后填新 DSCP（如 20）点“发送途中换标”，预期横幅给出
+#    分界序号，收端分段表新段由“待确认”转“已确认”，两段错标 0、ECN 恒为 ECT(0)；
+#    可在 lab-dst 内用 tcpdump 复核：ip netns exec lab-dst tcpdump -vv -i downlink -c 5 'udp port 5001'
 docker exec -it gsb-linklab tc -s class show dev uplink      # 需经 netns：
 docker exec -it gsb-linklab ip netns exec lab-src tc -s class show dev uplink
 ```
@@ -243,3 +321,12 @@ docker exec -it gsb-linklab ip netns exec lab-src tc -s class show dev uplink
   “不低于保底 + 可借用到 ceil”，未承诺精确的超额切分数值。
 - 未提供 IPv6 分类规则（u32 仅匹配 IPv4 UDP dport）；实验地址固定为
   `10.77.0.0/24`，可通过 `LAB_*` 环境变量调整。
+- DSCP 换标核验当前只在**告警流（UDP/5001）**网页开放（录像流保留同一套收端
+  计数但不提供换标按钮，符合“先核验告警分队列”的范围）；每轮仅允许切换一次，
+  不支持在一次试发内连续多次换标。
+- 收端用 `IP_RECVTOS`/`recvmsg` 读 TOS，已在本机 loopback 实测可真实读回；
+  若某平台不支持该辅助项，会计入 `unknown_tos` 而不是伪造通过。环形缓冲默认
+  2048 项（约亚秒级窗口），正常换标远在该窗口内；极端情况下若计划晚于环形深度
+  才到，被驱逐的报文按旧段处理并计 `ring_evicted`，内存仍严格有界。
+- DSCP 功能尚未在真实 veth/下游交换机链路抓包复核（沙箱无 `CAP_NET_ADMIN`/
+  docker），目标机应按第 7 节清单用 `tcpdump -vv` 再确认一次 DSCP/ECN 位。

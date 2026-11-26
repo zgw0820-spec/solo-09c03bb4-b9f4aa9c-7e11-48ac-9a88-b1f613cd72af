@@ -69,6 +69,11 @@ def create_app(
             flows = FlowManager(run_dir=run_dir, topo=topo, start_receiver=True)
         except Exception as e:  # pragma: no cover - defensive
             app.logger.warning("FlowManager unavailable: %s", e)
+            try:
+                if flows is not None:
+                    flows.stop_all()
+            except Exception:
+                pass
             flows = None
 
     app.extensions["lab_manager"] = manager
@@ -186,6 +191,17 @@ def create_app(
             return jsonify(flows.stop_flow(key))
         except KeyError:
             return jsonify({"stopped": False, "reason": f"未知流: {key}"}), 404
+
+    @app.post("/api/flows/<key>/remark")
+    def api_flow_remark(key: str) -> Any:
+        """Switch the DSCP marker of a running flow exactly once per trial."""
+        if key not in ("alarm", "video"):
+            return jsonify({"ok": False, "reason": f"未知流: {key}"}), 404
+        if flows is None:
+            return jsonify({"ok": False, "reason": "流量管理器未启用"}), 503
+        body = request.get_json(silent=True) or request.form.to_dict()
+        result = flows.remark_flow(key, body.get("new_dscp"))
+        return jsonify(result), 200 if result.get("ok") else 409
 
     @app.post("/api/flows/stop-all")
     def api_flows_stop_all() -> Any:

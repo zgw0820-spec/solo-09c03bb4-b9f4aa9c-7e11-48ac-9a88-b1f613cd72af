@@ -120,6 +120,25 @@ class WebApiTests(unittest.TestCase):
         data = r.get_json()
         self.assertTrue(data["disabled"])
 
+    def test_remark_endpoint_disabled_without_runtime(self):
+        r = self.client.post(
+            "/api/flows/alarm/remark", json={"new_dscp": 20}
+        )
+        self.assertEqual(r.status_code, 503)
+        self.assertFalse(r.get_json()["ok"])
+
+    def test_remark_unknown_flow_404(self):
+        r = self.client.post(
+            "/api/flows/nope/remark", json={"new_dscp": 20}
+        )
+        self.assertEqual(r.status_code, 404)
+
+    def test_index_contains_dscp_panel(self):
+        r = self.client.get("/")
+        body = r.get_data(as_text=True)
+        self.assertIn("DSCP 换标核验", body)
+        self.assertIn("dscp-alarm-input", body)
+
     def test_kernel_endpoint_with_fake_runner(self):
         r = self.client.get("/api/kernel")
         self.assertEqual(r.status_code, 200)

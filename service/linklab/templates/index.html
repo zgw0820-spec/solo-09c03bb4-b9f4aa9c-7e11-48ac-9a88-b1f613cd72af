@@ -121,6 +121,25 @@
           <button class="btn btn-small btn-primary" data-act="start" data-flow="alarm">开始</button>
           <button class="btn btn-small" data-act="stop" data-flow="alarm">停止</button>
         </div>
+
+        <!-- DSCP 途中换标核验（每轮试发从 DSCP 0 / ECT(0) 开始，仅可切换一次） -->
+        <div class="dscp-box" id="dscp-alarm-box">
+          <div class="dscp-head">
+            <strong>DSCP 换标核验</strong>
+            <span class="mono small">起始 DSCP 0 / ECT(0)（TOS 0x01）· 每轮仅可途中切换一次</span>
+          </div>
+          <div class="dscp-ctrl">
+            <label>新 DSCP（1~63）
+              <input type="number" id="dscp-alarm-input" min="1" max="63" step="1" value="20">
+            </label>
+            <button class="btn btn-small btn-primary" id="btnRemarkAlarm">发送途中换标</button>
+            <span class="hint" id="dscp-alarm-hint">ECN 两位保持不变；换标失败会继续用旧标记并给出原因。</span>
+          </div>
+          <div id="dscp-alarm-banner" class="banner hidden"></div>
+          <div id="dscp-alarm-view" class="dscp-view">
+            <p class="muted small">开始试发后展示分段核验结果；新段收到首个包前显示“待确认”。</p>
+          </div>
+        </div>
       </div>
 
       <div class="flow-card video-box" data-flow="video">

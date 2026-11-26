@@ -249,6 +249,111 @@
     loadFlows();
   });
 
+  // ---------------------------------------------------------------------
+  // DSCP re-marking (alarm flow; one switch per sending round)
+  // ---------------------------------------------------------------------
+  $("btnRemarkAlarm").addEventListener("click", async function () {
+    var btn = $("btnRemarkAlarm");
+    var raw = $("dscp-alarm-input").value;
+    var dscp = parseInt(raw, 10);
+    if (!(dscp >= 1 && dscp <= 63)) {
+      showDscpBanner(false, "新 DSCP 必须是 1~63 的整数，当前输入: " + esc(raw));
+      return;
+    }
+    btn.disabled = true;
+    try {
+      var r = await postJSON("/api/flows/alarm/remark", { new_dscp: dscp });
+      if (r.ok) {
+        showDscpBanner(true,
+          "✅ 换标已生效：新标记 <b>DSCP " + esc(r.new_dscp) +
+          " / " + esc(r.ecn === 1 ? "ECT(0)" : r.ecn) +
+          "</b> 从序号 <b>" + esc(r.boundary_seq) + "</b> 起用；" +
+          "序号连续、ECN 两位保留。等待收端确认新段实收标记…");
+      } else {
+        showDscpBanner(false, "⚠ 换标未生效，发端继续使用旧标记 DSCP 0 / ECT(0)：" +
+          esc(r.reason || "未知原因") + "（录像/告警试发不受影响，继续发包）");
+      }
+    } catch (err) {
+      showDscpBanner(false, "换标请求失败：" + esc(err));
+    } finally {
+      btn.disabled = false;
+      loadFlows();
+    }
+  });
+
+  function showDscpBanner(ok, html) {
+    var b = $("dscp-alarm-banner");
+    b.className = "banner " + (ok ? "ok" : "err");
+    b.innerHTML = html;
+    b.classList.remove("hidden");
+  }
+
+  function segRow(title, seg, boundaryNote) {
+    if (!seg) {
+      return "<tr><td>" + title + "</td><td colspan='5' class='muted'>" +
+        esc(boundaryNote || "未开始") + "</td></tr>";
+    }
+    var statusTag = seg.confirmed
+      ? "<span class='tag tag-ok'>已确认</span>"
+      : "<span class='tag tag-run'>待确认</span>";
+    var obs = Object.keys(seg.observed || {}).length
+      ? esc(JSON.stringify(seg.observed))
+      : "<span class='muted'>—</span>";
+    var badCls = seg.mismatch ? " class='cell-bad'" : "";
+    return "<tr>" +
+      "<td>" + title + "<div class='small muted'>期望 TOS 0x" +
+        Number(seg.expected_tos).toString(16).padStart(2, "0") + "</div></td>" +
+      "<td>" + statusTag + "</td>" +
+      "<td>" + esc(seg.expected_dscp) + "</td>" +
+      "<td>" + esc(seg.expected_ecn_name) + "</td>" +
+      "<td" + badCls + ">" + esc(seg.packets) + " 包 / 错标 <b>" +
+        esc(seg.mismatch) + "</b>" +
+        (seg.dscp_mismatch ? "（DSCP错 " + esc(seg.dscp_mismatch) + "）" : "") +
+        (seg.ecn_mismatch ? "（ECN错 " + esc(seg.ecn_mismatch) + "）" : "") +
+        "<div class='small muted'>实收TOS分布: " + obs + "</div></td>" +
+      "</tr>";
+  }
+
+  function renderDscp(flow) {
+    var view = $("dscp-alarm-view");
+    var rx = flow && flow.rx ? flow.rx : {};
+    var marking = rx.marking;
+    var ctl = flow && flow.marking_ctl ? flow.marking_ctl : {};
+    if (!marking) {
+      view.innerHTML = "<p class='muted small'>收端尚未上报标记核验数据（接收器未运行或还未收到包）。</p>";
+      return;
+    }
+    var segs = marking.segments || {};
+    var boundary = marking.boundary_seq;
+    var boundaryText = boundary == null
+      ? "尚未换标（全部报文按旧段 DSCP 0 / ECT(0) 核验）"
+      : "分界序号 <b>" + boundary + "</b>：seq &lt; " + boundary + " 为旧段，seq ≥ " +
+        boundary + " 为新段（晚到的旧包仍按序号归旧段）";
+    var head = "<p class='small' style='margin:.2rem 0 .5rem'>" + boundaryText + "</p>";
+    var table = "<table class='dscp-table'><thead><tr>" +
+      "<th>分段</th><th>状态</th><th>期望DSCP</th><th>期望ECN</th><th>实收核验（有界计数）</th>" +
+      "</tr></thead><tbody>" +
+      segRow("旧段 DSCP 0", segs.old) +
+      segRow("新段 DSCP " + (marking.new_dscp == null ? "?" : marking.new_dscp),
+             segs.new, "待确认（新段尚未收到任何包）") +
+      "</tbody></table>";
+    var summary;
+    if (marking.verified) {
+      summary = "<p class='dscp-ok'>✓ 核验通过：新段已收到包且两段实收 DSCP/ECN 全部符合期望，错标 0。</p>";
+    } else if (marking.plan_installed && segs.new && !segs.new.confirmed) {
+      summary = "<p class='dscp-pending'>⏳ 新段待确认：分界已发布，但收端还没收到序号 ≥ " +
+        boundary + " 的包。</p>";
+    } else if (marking.total_mismatch) {
+      summary = "<p class='dscp-bad'>✗ 发现错标包 " + marking.total_mismatch +
+        " 个（unknown_tos=" + marking.unknown_tos +
+        "，无法解析=" + marking.unparsable_packets + "）。</p>";
+    } else {
+      summary = "<p class='muted small'>当前错标 0，总包数 " + marking.total_packets +
+        (ctl.error ? "；发端曾报告换标问题: " + esc(ctl.error) : "") + "</p>";
+    }
+    view.innerHTML = head + table + summary;
+  }
+
   function drawSpark(key, value) {
     var data = sparkData[key];
     data.push(value);
@@ -294,6 +399,7 @@
       $("bar-" + key).style.width = Math.min(100, rate / total * 100) + "%";
       drawSpark(key, rate);
     });
+    renderDscp((s.flows || {}).alarm || {});
   }
 
   // ---------------------------------------------------------------------
